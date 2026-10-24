@@ -29,11 +29,42 @@ async function fetchModels() {
     }
 }
 
+// 全局单飞：同一时刻只允许一个 /chat/completions 在途。
+// 队列发起请求前用 whenRequestIdle() 等待，把「忙」当成可等待状态，而不是失败。
+let _requestIdleWaiters = [];
+let _requestDepth = 0;
+let _activeRequestChatId = null;
+
+// 当前真正占用 abortController 的会话（用于「停止生成」与发送键定位）
+function getActiveRequestChatId() { return _activeRequestChatId; }
+
+function whenRequestIdle(timeoutMs = 120000) {
+    if (!abortController) return Promise.resolve();
+    return new Promise(resolve => {
+        const waiter = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => {
+            _requestIdleWaiters = _requestIdleWaiters.filter(w => w !== waiter);
+            resolve();
+        }, timeoutMs);
+        _requestIdleWaiters.push(waiter);
+    });
+}
+
+function notifyRequestIdle() {
+    if (abortController) return;
+    const waiters = _requestIdleWaiters;
+    _requestIdleWaiters = [];
+    waiters.forEach(fn => { try { fn(); } catch (e) {} });
+}
+
 async function executeChatRequest(currentChat, preparedMessages, options = {}) {
     const failedResult = (error) => ({ ok: false, aborted: false, failed: true, error: error || null });
+    // 已有请求在途：返回 busy（可重试），不是失败——不能落成对话里的错误消息
+    if (abortController) return { ok: false, busy: true, skipped: true, aborted: false, failed: false, error: null };
     const requestController = new AbortController();
-    if (abortController) return failedResult(new Error('已有请求正在执行'));
     abortController = requestController;
+    _activeRequestChatId = currentChat ? currentChat.id : null;
+    _requestDepth++;
     try {
     updateSendButton(true);
     updateTrimIndicator();
@@ -393,7 +424,7 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
         }
     }
 
-    if (!requestFailed && !requestAborted && (botReply || reasoningBuffer)) {
+    if (!requestFailed && (botReply || reasoningBuffer)) {
         const liveChat = state.chats.find(chat => chat.id === currentChat.id);
         if (liveChat !== currentChat) {
             requestFailed = true;
@@ -402,7 +433,14 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
                 botDomObj.contentNode.innerHTML = `<div class="error-message"><span>${escapeHtml(requestError.message)}</span></div>`;
             }
         } else {
-            currentChat.messages.push({ role: 'assistant', content: reasoningBuffer ? `<think>${reasoningBuffer}</think>\n\n${botReply}` : botReply });
+            // 中止时也保留已生成的部分回复（标记 aborted），避免整段内容凭空消失
+            const assistantMsg = {
+                role: 'assistant',
+                content: reasoningBuffer ? `<think>${reasoningBuffer}</think>\n\n${botReply}` : botReply
+            };
+            if (requestAborted) assistantMsg.aborted = true;
+            if (options.queueItemId) assistantMsg._queueItemId = options.queueItemId;
+            currentChat.messages.push(assistantMsg);
             assistantCommitted = true;
             saveState();
         }
@@ -422,7 +460,10 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
         if (currentChat.id === state.currentChatId) renderMessages();
     }
 
-    if (abortController === requestController) abortController = null;
+    if (abortController === requestController) {
+        abortController = null;
+        _activeRequestChatId = null;
+    }
     updateSendButton(false);
     updateTrimIndicator();
     if (!isReuse && isTargetVisible()) DOM.userInput.focus();
@@ -432,7 +473,8 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
     if (assistantCommitted && !requestFailed && !requestAborted && currentChat.autoRetryOnRefuse && botReply) {
         const refuseResult = await checkRefuseAndRetry(currentChat, botDomObj && botDomObj.wrapper, {
             suppressQueueAutoProcess: options.suppressQueueAutoProcess,
-            refuseRetryDepth: options.refuseRetryDepth || 0
+            refuseRetryDepth: options.refuseRetryDepth || 0,
+            queueItemId: options.queueItemId
         }).catch(error => ({ refused: false, ok: false, result: failedResult(error) }));
         refused = !!refuseResult.refused;
         nestedRetryResult = refuseResult.refused ? refuseResult.result : null;
@@ -453,7 +495,7 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
     }
 
 // 未重试时才检查队列（重试中由最内层非重试调用处理队列）
-    // 请求失败或被中止时不自动继续队列；队列续跑统一由 QueueStore.process 驱动
+    // 请求失败或被中止时不自动继续队列；队列续跑统一由 QueueStore.pump 驱动
 
     return nestedRetryResult || {
         ok: !requestFailed && !requestAborted,
@@ -466,25 +508,31 @@ async function executeChatRequest(currentChat, preparedMessages, options = {}) {
         showToast(`消息请求失败：${error.message || error}`);
         return failedResult(error);
     } finally {
-        if (abortController === requestController) abortController = null;
+        if (abortController === requestController) {
+            abortController = null;
+            _activeRequestChatId = null;
+        }
+        // 嵌套调用（拒答重试）退到最外层时才唤醒等待中的队列
+        _requestDepth = Math.max(0, _requestDepth - 1);
+        if (_requestDepth === 0) notifyRequestIdle();
         updateSendButton(false);
         updateTrimIndicator();
     }
 }
 
 function stopGeneration() {
-    if (abortController) {
-        abortController.abort();
-        const chatId = state.currentChatId;
-        if (chatId && QueueStore.hasPending(chatId)) {
-            QueueStore.pause(chatId, 'user');
-            showToast("已停止生成，队列已手动暂停");
-        } else {
-            showToast("已停止生成");
-        }
-        updateSendButton(false);
-        renderQueue();
+    if (!abortController) return;
+    // 中止的目标是"正在跑的那个 chat"，不一定是当前显示的会话
+    const targetChatId = getActiveRequestChatId() || state.currentChatId;
+    abortController.abort();
+    if (targetChatId && QueueStore.hasPending(targetChatId)) {
+        QueueStore.pause(targetChatId, 'user');
+        showToast("已停止生成，队列已暂停");
+    } else {
+        showToast("已停止生成");
     }
+    updateSendButton(false);
+    renderQueue();
 }
 
 const SEND_BTN_TRIM_BADGE_HTML = '<span class="send-btn-trim-badge" id="trimBadge" title="将丢弃开头部分上下文以控制 Token 总量"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></span>';
@@ -503,14 +551,14 @@ function _setSendBtnContent(iconHtml) {
 
 function updateSendButton(isGenerating) {
     const chatId = state.currentChatId;
-    const hasActiveRequest = !!abortController;
+    // 只有"当前会话自己"的请求才把发送键变成停止键；别的会话在跑不影响这里发送
+    const activeChat = getActiveRequestChatId();
+    const hasOwnActiveRequest = !!abortController && (!activeChat || activeChat === chatId);
     const snap = chatId ? QueueStore.getSnapshot(chatId) : null;
-    if (snap && snap.paused && !snap.failedItem && !snap.items.length) {
-        QueueStore.resume(chatId);
-    }
-    const q = snap ? snap : { items: [], paused: false, failedItem: null, pauseReason: null };
-    const isLocked = !!isGenerating || QueueStore.isAnyBusy();
-    if (hasActiveRequest) {
+    const q = snap || { items: [], paused: false, pauseReason: null, failedItem: null, busy: false, sending: false };
+    const chatBusy = !!q.busy || !!isGenerating;
+
+    if (hasOwnActiveRequest) {
         _setSendBtnContent(STOP_BTN_ICON);
         DOM.sendBtn.onclick = stopGeneration;
         DOM.sendBtn.classList.add('stop-btn');
@@ -544,7 +592,7 @@ function updateSendButton(isGenerating) {
         DOM.queueBtn.innerHTML = QUEUE_CLEAR_ICON;
         DOM.queueBtn.onclick = clearQueueClick;
         DOM.queueBtn.title = '清空队列';
-    } else if (isLocked) {
+    } else if (chatBusy) {
         _setSendBtnContent(SEND_BTN_ICON);
         DOM.sendBtn.onclick = () => showToast('请求正在处理中，请稍候');
         DOM.sendBtn.classList.remove('stop-btn', 'retry-btn');
@@ -654,7 +702,8 @@ async function autoRetryRefuse(chat, wrapper, options = {}) {
     return await executeChatRequest(chat, null, {
         reuseWrapper: wrapper,
         suppressQueueAutoProcess: options.suppressQueueAutoProcess,
-        refuseRetryDepth: options.refuseRetryDepth || 0
+        refuseRetryDepth: options.refuseRetryDepth || 0,
+        queueItemId: options.queueItemId
     });
 }
 

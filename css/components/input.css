@@ -364,6 +364,44 @@
     animation: queueItemEnter var(--duration-enter) var(--ease-out-expo) both;
 }
 .queue-item:hover { border-color: var(--border-mid); background: var(--surface-1); }
+
+/* 每项外包一层，便于在消息下方挂失败详情 */
+.queue-item-wrap { margin-top: 8px; }
+.queue-item-wrap .queue-item { margin-top: 0; }
+.queue-item-wrap.failed .queue-item { border-color: var(--danger); background: var(--danger-faint); }
+.queue-item-wrap.sending .queue-item { border-color: var(--accent-color); }
+
+.queue-item-tag {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    line-height: 1.6;
+    vertical-align: middle;
+    background: var(--surface-hover);
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.queue-item-tag.sending { background: var(--accent-faint); color: var(--accent-color); }
+.queue-item-tag.failed { background: var(--danger); color: #fff; }
+
+.queue-item-error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding: 8px 10px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--danger-strong);
+    background: var(--danger-faint);
+    border: 1px dashed color-mix(in srgb, var(--danger) 50%, transparent);
+    border-radius: var(--radius-sm);
+}
+.queue-item-error-text { flex: 1; min-width: 0; word-break: break-word; }
 .queue-item-num {
     background: var(--accent-color);
     color: var(--accent-text);
@@ -430,6 +468,13 @@
 @keyframes queuePausedPulse {
     0%, 100% { box-shadow: 0 1px 4px color-mix(in srgb, var(--danger) 30%, transparent); }
     50% { box-shadow: 0 1px 10px color-mix(in srgb, var(--danger) 60%, transparent); }
+}
+/* 发送中状态用强调色，不闪红 */
+.queue-status.sending {
+    background: var(--accent-color);
+    color: var(--accent-text);
+    animation: none;
+    box-shadow: none;
 }
 
 /* ── Queue header actions (clear button) ── */

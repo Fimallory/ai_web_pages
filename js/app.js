@@ -98,11 +98,11 @@ function createNewChat(render = true) {
     if (render) closeSettings();
     const newChat = { id: Date.now().toString(), title: "新对话", messages: [], maxTokens: 0, contextLimit: 131072, contextLimitWarned: false, temperature: 0.7, stream: true, systemPrompt: '', userPrefix: '', selectedPreset: 'custom' };
     state.chats.unshift(newChat); state.currentChatId = newChat.id; state.editingIndex = -1; saveState();
-    if (render) { renderChatList(); renderMessages(); updateTrimIndicator(); updatePrefixBadge(); DOM.userInput.focus(); renderQueue(); }
+    if (render) { renderChatList(); renderMessages(); updateTrimIndicator(); updatePrefixBadge(); DOM.userInput.focus(); renderQueue(); updateSendButton(false); }
 }
 
 function applySwitchChat(id) {
-    state.currentChatId = id; state.editingIndex = -1; setVisibleCount(id, MESSAGE_PAGE_SIZE); autoScroll = true; saveState(); renderChatList(); renderMessages(); updateTrimIndicator(); updatePrefixBadge(); closeSettings(); closeSidebar(); clearSearch(); renderQueue();
+    state.currentChatId = id; state.editingIndex = -1; setVisibleCount(id, MESSAGE_PAGE_SIZE); autoScroll = true; saveState(); renderChatList(); renderMessages(); updateTrimIndicator(); updatePrefixBadge(); closeSettings(); closeSidebar(); clearSearch(); renderQueue(); updateSendButton(false);
 }
 
 let _switchChatToken = 0;
@@ -133,7 +133,7 @@ async function deleteChat(id, event) {
     if(state.currentChatId === id) state.currentChatId = state.chats.length ? state.chats[0].id : null;
     if(state.chats.length === 0) createNewChat(false);
     QueueStore.discardChat(id);
-    saveState(); renderChatList(); renderMessages(); renderQueue();
+    saveState(); renderChatList(); renderMessages(); renderQueue(); updateSendButton(false);
 }
 
 async function clearCurrentChat() {
@@ -141,7 +141,7 @@ async function clearCurrentChat() {
     if (!(await showConfirm("确定清空当前对话的所有消息吗？此操作无法撤销。"))) return;
     if (QueueStore.isAnyBusy() || abortController) return showToast("请等待当前请求完成");
     const chat = state.chats.find(c => c.id === state.currentChatId);
-    if(chat) { chat.messages = []; state.editingIndex = -1; saveState(); renderMessages(); updateTrimIndicator(); showToast("对话已清空"); }
+    if(chat) { chat.messages = []; state.editingIndex = -1; saveState(); QueueStore.discardChat(chat.id); renderMessages(); renderQueue(); updateTrimIndicator(); showToast("对话已清空"); }
 }
 
 function renderChatList() {
@@ -236,7 +236,7 @@ function enqueueReplayFrom(chat, fromIndex, includeSelf) {
 }
 
 // 串行重试改造为「全部入队」：从指定 index 起截断消息，把剩余 user 消息按原顺序
-// 推入队列前方，交由 QueueStore.process 统一处理。失败时由队列暂停机制
+// 推入队列前方，交由 QueueStore.pump 统一处理。失败时由队列暂停机制
 // （retryLastAndResume / clearQueue）接管。
 async function retryUserMessagesFrom(chat, index) {
     if (QueueStore.isPaused(chat.id)) return showToast("请先处理当前暂停消息");
@@ -256,7 +256,19 @@ async function retryUserMessagesFrom(chat, index) {
     renderQueue();
     showToast(n > 1 ? `已加入队列 ${n} 条，开始重放` : '开始重试用户消息');
     updateSendButton(false);
-    QueueStore.process(chat.id);
+    QueueStore.pump();
+}
+
+// 就地重生成（不走队列）：必须等全局请求空闲，避免与队列抢 abortController
+async function runChatRequestIdle(chat, preparedMessages, options = {}) {
+    for (let attempt = 0; attempt < 10; attempt++) {
+        await whenRequestIdle();
+        const result = await executeChatRequest(chat, preparedMessages, options);
+        if (!result || !result.busy) return result;
+        await new Promise(r => setTimeout(r, 300));
+    }
+    showToast('当前有请求正在处理，请稍后再试');
+    return { ok: false, busy: true, skipped: true, aborted: false, failed: false, error: null };
 }
 
 // 工具栏「重试」：询问用户是否将该消息之后的所有 user 消息按原顺序加入队列重放。
@@ -288,6 +300,8 @@ async function retryAssistantMessage(chat, index) {
         QueueStore.markBusy(chat.id);
         updateSendButton(false);
         try {
+            // 先等全局空闲再动消息，避免"已截断却在等别的会话"的中间态
+            await whenRequestIdle();
             let reuseWrapper = null;
             const w = getWrapperForIndex(index);
             if (w && w.classList.contains('bot') && w.isConnected) reuseWrapper = w;
@@ -314,7 +328,7 @@ async function retryAssistantMessage(chat, index) {
                     reuseWrapper.addEventListener('animationend', onEnd);
                     setTimeout(onEnd, 400);
                 });
-                const result = await executeChatRequest(chat, null, { reuseWrapper });
+                const result = await runChatRequestIdle(chat, null, { reuseWrapper });
                 if (!result || !result.ok) {
                     chat.messages = backup;
                     saveState();
@@ -323,7 +337,7 @@ async function retryAssistantMessage(chat, index) {
                 return result;
             }
             renderMessages();
-            const result = await executeChatRequest(chat);
+            const result = await runChatRequestIdle(chat);
             if (!result || !result.ok) {
                 chat.messages = backup;
                 saveState();
@@ -345,7 +359,7 @@ async function retryAssistantMessage(chat, index) {
     renderQueue();
     showToast(`已加入队列 ${n} 条，开始重放`);
     updateSendButton(false);
-    QueueStore.process(chat.id);
+    QueueStore.pump();
 }
 
 // 单条消息重试：统一走队列重放。user 消息截断到自身并连同其后 user 消息入队；
@@ -369,7 +383,7 @@ async function retryMessage(index) {
         renderQueue();
         showToast(n > 1 ? `已加入队列 ${n} 条，开始重放` : '开始重试用户消息');
         updateSendButton(false);
-        QueueStore.process(chat.id);
+        QueueStore.pump();
         return;
     }
 
@@ -382,7 +396,7 @@ async function retryMessage(index) {
         renderQueue();
         showToast(`已加入队列 ${n} 条，开始重放`);
         updateSendButton(false);
-        QueueStore.process(chat.id);
+        QueueStore.pump();
         return;
     }
 
@@ -391,13 +405,14 @@ async function retryMessage(index) {
     QueueStore.markBusy(chat.id);
     updateSendButton(false);
     try {
+        await whenRequestIdle();
         state.editingIndex = -1;
         const reuseWrapper = getWrapperForIndex(index);
         chat.messages = chat.messages.slice(0, index);
         saveState();
         if (!reuseWrapper || !reuseWrapper.isConnected) renderMessages();
         showToast("正在重试...");
-        const result = await executeChatRequest(chat, null, { reuseWrapper: reuseWrapper && reuseWrapper.isConnected ? reuseWrapper : undefined });
+        const result = await runChatRequestIdle(chat, null, { reuseWrapper: reuseWrapper && reuseWrapper.isConnected ? reuseWrapper : undefined });
         if (!result.ok) {
             chat.messages = backup;
             saveState();
@@ -994,7 +1009,9 @@ function buildContextWithTrim(chat, newUserContent = null) {
     const systemMsg = chatSystemPrompt ? { role: 'system', content: chatSystemPrompt } : null;
     const newMsg = newUserContent !== null ? { role: 'user', content: newUserContent } : null;
 
-    let conversationMsgs = chat.messages.map(m => ({ role: m.role, content: m.content }));
+    let conversationMsgs = chat.messages
+        .filter(m => !m.isError)
+        .map(m => ({ role: m.role, content: m.content }));
 
     let dropped20 = 0;
     if (chat && chat.dropFront20 && conversationMsgs.length > 0) {
@@ -1217,13 +1234,15 @@ async function sendMessage() {
     renderAttachments();
     updateTrimIndicator();
 
-    const item = QueueStore.enqueue(chatId, content);
+    QueueStore.enqueue(chatId, content);
+    renderQueue();
     if (QueueStore.isBusy(chatId) || QueueStore.isPaused(chatId)) {
-        renderQueue();
         showToast(QueueStore.isPaused(chatId) ? "队列已暂停，消息已加入队列" : "已加入队列，等待当前回复完成");
         return true;
     }
-    await QueueStore.process(chatId);
+    // 别的会话正在请求：入队等待，由 pump 在空闲后接手，不能算失败
+    if (QueueStore.isAnyBusy() || abortController) showToast("已加入队列，等待当前请求完成");
+    await QueueStore.pump();
     return true;
 }
 
@@ -1339,6 +1358,7 @@ async function init() {
         if (!state.currentChatId || !state.chats.find(c => c.id === state.currentChatId)) state.currentChatId = state.chats[0].id;
         renderChatList(); renderMessages(); updateTrimIndicator();
     }
+    QueueStore.purgeLegacyErrors();
     await QueueStore.restore();
     QueueStore.onChange(() => {
         renderQueue();
